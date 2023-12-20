@@ -1,5 +1,7 @@
 import Foundation
+import OSLog
 
+@available(macOS 11.0, *)
 public class TaskQueue{
     private class PendingTask{
         let label:String?
@@ -43,21 +45,21 @@ public class TaskQueue{
         scope = Task{
             for await pendingTask in pendingTasks
             {
-//                print("PendingTask \(pendingTask.label ?? "") received", label ?? "")
-//                print("\(label ?? "TaskQueue"): scope isCancelled \(Task.isCancelled)")
+                logger?.log("PendingTask \(pendingTask.label ?? "", privacy: .public) received")
+                logger?.log("scope isCancelled \(Task.isCancelled)")
                 if(Task.isCancelled){ break }
                 if(pendingTask.isCancelled) { continue }
                 if let task = pendingTask as? AsyncTask
                 {
                     do{
-//                        print("AsyncTask \(pendingTask.tag ?? "") start",source: tag)
+                        logger?.log("AsyncTask \(pendingTask.label ?? "", privacy: .public) start")
                         let result = try await task.block()
-//                        print("AsyncTask \(pendingTask.tag ?? "") resume",source: tag)
+                        logger?.log("AsyncTask \(pendingTask.label ?? "", privacy: .public) resume")
                         task.continuation?.resume(returning: result)
                     }
                     catch
                     {
-//                        log.error("AsyncTask \(pendingTask.tag ?? "") error \(error)",source: tag)
+                        logger?.error("AsyncTask \(pendingTask.label ?? "") error \(error)")
                         task.continuation?.resume(throwing: error)
                     }
                 }
@@ -65,25 +67,25 @@ public class TaskQueue{
                 {
                     do
                     {
-//                        print("StreamTask \(pendingTask.tag ?? "") start",source: tag)
+                        logger?.log("StreamTask \(pendingTask.label ?? "") start")
                         for try await value in AsyncThrowingStream(Any.self, task.block)
                         {
-//                            print("StreamTask \(pendingTask.tag ?? "") yield",source: tag)
+                            logger?.log("StreamTask \(pendingTask.label ?? "") yield")
                             task.continuation.yield(value)
                         }
-//                        print("StreamTask \(pendingTask.tag ?? "") finish",source: tag)
+                        logger?.log("StreamTask \(pendingTask.label ?? "") finish")
                         task.continuation.finish()
                     }
                     catch
                     {
-//                        log.error("StreamTask \(pendingTask.tag ?? "") error \(error)",source: tag)
+                        logger?.error("StreamTask \(pendingTask.label ?? "") error \(error)")
                         task.continuation.finish(throwing: error)
                     }
                     
                 }
                 else
                 {
-//                    print("PendingTask discard \(pendingTask)", label ?? "")
+                    logger?.log("PendingTask discard \(pendingTask.label ?? "")")
                 }
                 if(Task.isCancelled){ break }
             }
@@ -101,8 +103,14 @@ public class TaskQueue{
         }
     }
     
-    public init(label: String? = nil){
+    private var logger: Logger? = nil
+    public init(label: String? = nil, debugLog: Bool = false) {
         self.label = label
+        if debugLog {
+            logger = Logger(
+                subsystem: "rickymohk",
+                category: label ?? "default"
+            )
         }
         
         (pendingTasks, pendingTasksContinuation) = AsyncStream.makeStream()
