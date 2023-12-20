@@ -1,5 +1,7 @@
 import Foundation
+import OSLog
 
+@available(macOS 11.0, *)
 public class TaskQueue{
     private class PendingTask{
         let label:String?
@@ -32,44 +34,32 @@ public class TaskQueue{
     
     public let label:String?
     
-    private var pendingTasksContinuation: AsyncStream<PendingTask>.Continuation?
+    private let pendingTasksContinuation: AsyncStream<PendingTask>.Continuation
     
-    private var pendingTasks: AsyncStream<PendingTask>?
+    private let pendingTasks: AsyncStream<PendingTask>
     
     private var scope: Task<Void,Never>?
-    
-    private let initTaskDispatchQueue = DispatchQueue(label: "initTask")
-    
-    private var initTask: Task<Void,Error>?
-    
-    private var preInitPendingTasks: [PendingTask] = []
-    
-    private func initScope(initContinuation:CheckedContinuation<Void,Never>)
+        
+    private func initScope()
     {
-        pendingTasks = AsyncStream{ continuation in
-            pendingTasksContinuation = continuation
-//            print("pendingTasksContinuation initialized")
-            initContinuation.resume()
-        }
         scope = Task{
-            guard let pendingTasks = pendingTasks else { return }
             for await pendingTask in pendingTasks
             {
-//                print("PendingTask \(pendingTask.label ?? "") received", label ?? "")
-//                print("\(label ?? "TaskQueue"): scope isCancelled \(Task.isCancelled)")
+                logger?.log("PendingTask \(pendingTask.label ?? "", privacy: .public) received")
+                logger?.log("scope isCancelled \(Task.isCancelled)")
                 if(Task.isCancelled){ break }
                 if(pendingTask.isCancelled) { continue }
                 if let task = pendingTask as? AsyncTask
                 {
                     do{
-//                        print("AsyncTask \(pendingTask.tag ?? "") start",source: tag)
+                        logger?.log("AsyncTask \(pendingTask.label ?? "", privacy: .public) start")
                         let result = try await task.block()
-//                        print("AsyncTask \(pendingTask.tag ?? "") resume",source: tag)
+                        logger?.log("AsyncTask \(pendingTask.label ?? "", privacy: .public) resume")
                         task.continuation?.resume(returning: result)
                     }
                     catch
                     {
-//                        log.error("AsyncTask \(pendingTask.tag ?? "") error \(error)",source: tag)
+                        logger?.error("AsyncTask \(pendingTask.label ?? "") error \(error)")
                         task.continuation?.resume(throwing: error)
                     }
                 }
@@ -77,25 +67,25 @@ public class TaskQueue{
                 {
                     do
                     {
-//                        print("StreamTask \(pendingTask.tag ?? "") start",source: tag)
+                        logger?.log("StreamTask \(pendingTask.label ?? "") start")
                         for try await value in AsyncThrowingStream(Any.self, task.block)
                         {
-//                            print("StreamTask \(pendingTask.tag ?? "") yield",source: tag)
+                            logger?.log("StreamTask \(pendingTask.label ?? "") yield")
                             task.continuation.yield(value)
                         }
-//                        print("StreamTask \(pendingTask.tag ?? "") finish",source: tag)
+                        logger?.log("StreamTask \(pendingTask.label ?? "") finish")
                         task.continuation.finish()
                     }
                     catch
                     {
-//                        log.error("StreamTask \(pendingTask.tag ?? "") error \(error)",source: tag)
+                        logger?.error("StreamTask \(pendingTask.label ?? "") error \(error)")
                         task.continuation.finish(throwing: error)
                     }
                     
                 }
                 else
                 {
-//                    print("PendingTask discard \(pendingTask)", label ?? "")
+                    logger?.log("PendingTask discard \(pendingTask.label ?? "")")
                 }
                 if(Task.isCancelled){ break }
             }
@@ -113,32 +103,19 @@ public class TaskQueue{
         }
     }
     
-    public init(label: String? = nil){
+    private var logger: Logger? = nil
+    public init(label: String? = nil, debugLog: Bool = false) {
         self.label = label
-        initTask = Task{
-            await withCheckedContinuation{ initScope(initContinuation: $0) }
-            //pendingTasks should be available since here
-//            print("initScope done. pendingTasksContinuation=\(pendingTasksContinuation)")
-            try initTaskDispatchQueue.sync {
-                if let pendingTasksContinuation = pendingTasksContinuation
-                {
-                    
-//                    print("yield preInitPendingTasks start \(preInitPendingTasks.count)")
-                    for pendingTask in preInitPendingTasks
-                    {
-                        pendingTasksContinuation.yield(pendingTask)
-                    }
-//                    print("yield preInitPendingTasks done \(preInitPendingTasks.count)")
-                    
-                }
-                else
-                {
-                    throw fatalError("pendingTasksContinuation not available after init")
-                }
-            }
-//            print("initTask done")
-            initTask = nil
+        if debugLog {
+            logger = Logger(
+                subsystem: "rickymohk",
+                category: label ?? "default"
+            )
         }
+        
+        (pendingTasks, pendingTasksContinuation) = AsyncStream.makeStream()
+
+        initScope()
     }
     
     public func close()
@@ -152,28 +129,11 @@ public class TaskQueue{
     
     public func dispatch(label:String?=nil,block: @escaping () async throws -> Void)
     {
-        if initTask == nil, let pendingTasksContinuation = pendingTasksContinuation
-        {
-//            print("yield directly \(label)")
-            pendingTasksContinuation.yield(AsyncTask(label: label, continuation: nil, block: block))
-        }
-        else
-        {
-            initTaskDispatchQueue.sync {
-//                print("append preInitPendingTasks \(label) start \(preInitPendingTasks.count)")
-                preInitPendingTasks.append(AsyncTask(label: label, continuation: nil, block: block))
-//                print("append preInitPendingTasks \(label) done \(preInitPendingTasks.count)")
-            }
-        }
+        pendingTasksContinuation.yield(AsyncTask(label: label, continuation: nil, block: block))
     }
     
     public func dispatch<T>(label:String?=nil,block: @escaping () async throws -> T) async throws -> T
     {
-        if let initTask = initTask
-        {
-            try await initTask.value
-        }
-        
         var pendingTask : AsyncTask?
         let cancel = {
             pendingTask?.isCancelled = true
@@ -182,7 +142,7 @@ public class TaskQueue{
             return (try await withCheckedThrowingContinuation({ continuation in
                 let task = AsyncTask(label: label, continuation: continuation, block: block)
                 pendingTask = task
-                pendingTasksContinuation?.yield(task)
+                pendingTasksContinuation.yield(task)
             })) as! T
         } onCancel: {
             cancel()
@@ -192,7 +152,7 @@ public class TaskQueue{
     public func dispatchStream<T>( label:String?=nil, block:@escaping (AsyncThrowingStream<T,Error>.Continuation) -> Void) -> AsyncThrowingStream<T,Error>
     {
         let anyStream = AsyncThrowingStream<Any,Error> { continuation in
-            pendingTasksContinuation?.yield(StreamTask(label: label, continuation: continuation, block: { anyContinuation in
+            pendingTasksContinuation.yield(StreamTask(label: label, continuation: continuation, block: { anyContinuation in
                 Task{
                     do
                     {
@@ -212,10 +172,6 @@ public class TaskQueue{
         return AsyncThrowingStream<T,Error> { typedContinuation in
             Task
             {
-                if let initTask = initTask
-                {
-                    try await initTask.value
-                }
                 do{
                     for try await element in anyStream
                     {
